@@ -6,7 +6,9 @@ from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     CallbackQueryHandler,
+    MessageHandler,
     ContextTypes,
+    filters
 )
 
 # ========================
@@ -106,6 +108,15 @@ async def handle_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await open_ad(query)
     elif query.data.startswith("done_"):
         await close_task_before_finish(query)
+    elif query.data.startswith("main_menu"):
+        await query.edit_message_text(
+            "👋 Back to main menu!",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📈 Balance", callback_data="balance")],
+                [InlineKeyboardButton("👥 Referrals", callback_data="referrals")],
+                [InlineKeyboardButton("💰 Start Earning", callback_data="start_earning")]
+            ])
+        )
 
 # ========================
 # BALANCE SCREEN
@@ -186,7 +197,6 @@ async def open_ad(query):
         pass
 
     update_points(query.from_user.id, 5)
-
     await query.message.reply_text("🎉 5 points have been added to your balance!")
 
 def back_to_main():
@@ -199,6 +209,112 @@ async def close_task_before_finish(query):
         await query.edit_message_text(text=query.message.text + "\n\n(Timed Task Cancelled)")
     except:
         pass
+
+# ========================
+# ADMIN PANEL
+# ========================
+
+ADMIN_USERNAME = "Onuohahq"
+
+async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    username = update.effective_user.username
+    if username != ADMIN_USERNAME:
+        await update.message.reply_text("❌ Access denied.")
+        return
+
+    keyboard = [
+        [InlineKeyboardButton("👤 View User Stats", callback_data="admin_view_user")],
+        [InlineKeyboardButton("➕ Add Points", callback_data="admin_add_points")],
+        [InlineKeyboardButton("➖ Remove Points", callback_data="admin_remove_points")],
+        [InlineKeyboardButton("♻️ Reset User Stats", callback_data="admin_reset_user")],
+        [InlineKeyboardButton("📢 Broadcast Message", callback_data="admin_broadcast")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("🛠 Admin Panel", reply_markup=reply_markup)
+
+async def handle_admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    username = query.from_user.username
+    if username != ADMIN_USERNAME:
+        await query.answer("❌ Access denied.", show_alert=True)
+        return
+
+    if query.data == "admin_view_user":
+        await query.edit_message_text("Send me the user_id of the user you want to check:")
+        context.user_data['admin_action'] = 'view_user'
+    elif query.data == "admin_add_points":
+        await query.edit_message_text("Send in the format: user_id points_to_add\nExample: 123456 50")
+        context.user_data['admin_action'] = 'add_points'
+    elif query.data == "admin_remove_points":
+        await query.edit_message_text("Send in the format: user_id points_to_remove\nExample: 123456 20")
+        context.user_data['admin_action'] = 'remove_points'
+    elif query.data == "admin_reset_user":
+        await query.edit_message_text("Send the user_id of the user you want to reset:")
+        context.user_data['admin_action'] = 'reset_user'
+    elif query.data == "admin_broadcast":
+        await query.edit_message_text("Send the message you want to broadcast to all users:")
+        context.user_data['admin_action'] = 'broadcast'
+
+async def admin_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if 'admin_action' not in context.user_data:
+        return
+
+    action = context.user_data['admin_action']
+    text = update.message.text.strip()
+
+    if action == 'view_user':
+        if not text.isdigit():
+            await update.message.reply_text("❌ Invalid user_id.")
+            return
+        user = get_user(int(text))
+        if not user:
+            await update.message.reply_text("⚠️ User not found.")
+            return
+        msg = f"👤 User Stats:\n\nUser ID: {user[0]}\nPoints: {user[1]}\nReferrals: {user[2]}"
+        await update.message.reply_text(msg)
+
+    elif action == 'add_points':
+        try:
+            user_id, points = map(int, text.split())
+            update_points(user_id, points)
+            await update.message.reply_text(f"✅ Added {points} points to user {user_id}")
+        except:
+            await update.message.reply_text("❌ Format invalid. Use: user_id points_to_add")
+
+    elif action == 'remove_points':
+        try:
+            user_id, points = map(int, text.split())
+            update_points(user_id, -points)
+            await update.message.reply_text(f"✅ Removed {points} points from user {user_id}")
+        except:
+            await update.message.reply_text("❌ Format invalid. Use: user_id points_to_remove")
+
+    elif action == 'reset_user':
+        if not text.isdigit():
+            await update.message.reply_text("❌ Invalid user_id.")
+            return
+        user_id = int(text)
+        with sqlite3.connect(DB_NAME) as conn:
+            cursor = conn.cursor()
+            cursor.execute("UPDATE users SET points=0, referrals=0 WHERE user_id=?", (user_id,))
+            cursor.execute("DELETE FROM tasks WHERE user_id=?", (user_id,))
+            conn.commit()
+        await update.message.reply_text(f"⚠️ User {user_id} stats have been reset!")
+
+    elif action == 'broadcast':
+        with sqlite3.connect(DB_NAME) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT user_id FROM users")
+            users = cursor.fetchall()
+        for uid in users:
+            try:
+                await context.bot.send_message(chat_id=uid[0], text=text)
+            except:
+                continue
+        await update.message.reply_text("✅ Broadcast sent.")
+
+    context.user_data.pop('admin_action')
 
 # ========================
 # REPLIT SERVER KEEP-ALIVE
@@ -215,6 +331,9 @@ def home():
 def run():
     app.run(host="0.0.0.0", port=8080)
 
+# ========================
+# MAIN BOT INITIALIZATION
+# ========================
 if __name__ == "__main__":
     init_db()
     print("[+] Initializing Telegram Bot...")
@@ -227,9 +346,14 @@ if __name__ == "__main__":
 
     # Command Handlers
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("admin", admin_menu))
 
-    # Callback Query Handler
+    # Callback Query Handlers
     application.add_handler(CallbackQueryHandler(handle_menu_button))
+    application.add_handler(CallbackQueryHandler(handle_admin_buttons, pattern="^admin_"))
+
+    # Text Handler for admin inputs
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_text_handler))
 
     # Web Server Thread for Replit
     thread = Thread(target=run)
