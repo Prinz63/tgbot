@@ -211,14 +211,21 @@ async def close_task_before_finish(query):
         pass
 
 # ========================
-# ADMIN PANEL
+# FULLY CLICKABLE ADMIN PANEL
 # ========================
 
-ADMIN_USERNAME = "onuohahq"
+ADMIN_USERNAME = "Onuohahq"
 
+# Helper: get top users (default 10)
+def get_top_users(limit=10):
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT user_id, points, referrals FROM users ORDER BY points DESC LIMIT ?", (limit,))
+        return cursor.fetchall()
+
+# Admin main menu
 async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    username = update.effective_user.username
-    if username != ADMIN_USERNAME:
+    if update.effective_user.username != ADMIN_USERNAME:
         await update.message.reply_text("❌ Access denied.")
         return
 
@@ -232,6 +239,15 @@ async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text("🛠 Admin Panel", reply_markup=reply_markup)
 
+# Show list of top users for action
+async def show_user_list(update: Update, context: ContextTypes.DEFAULT_TYPE, action):
+    users = get_top_users()
+    keyboard = [[InlineKeyboardButton(f"{uid} | Points:{pts} | Ref:{ref}", callback_data=f"{action}_{uid}")] for uid, pts, ref in users]
+    keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="admin_main_menu")])
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.edit_message_text("Select a user:", reply_markup=reply_markup)
+
+# Admin callback handler
 async def handle_admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -240,69 +256,76 @@ async def handle_admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.answer("❌ Access denied.", show_alert=True)
         return
 
-    if query.data == "admin_view_user":
-        await query.edit_message_text("Send me the user_id of the user you want to check:")
-        context.user_data['admin_action'] = 'view_user'
-    elif query.data == "admin_add_points":
-        await query.edit_message_text("Send in the format: user_id points_to_add\nExample: 123456 50")
-        context.user_data['admin_action'] = 'add_points'
-    elif query.data == "admin_remove_points":
-        await query.edit_message_text("Send in the format: user_id points_to_remove\nExample: 123456 20")
-        context.user_data['admin_action'] = 'remove_points'
-    elif query.data == "admin_reset_user":
-        await query.edit_message_text("Send the user_id of the user you want to reset:")
-        context.user_data['admin_action'] = 'reset_user'
-    elif query.data == "admin_broadcast":
-        await query.edit_message_text("Send the message you want to broadcast to all users:")
-        context.user_data['admin_action'] = 'broadcast'
+    data = query.data
 
-async def admin_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if 'admin_action' not in context.user_data:
+    if data == "admin_main_menu":
+        await admin_menu(query, context)
         return
 
-    action = context.user_data['admin_action']
-    text = update.message.text.strip()
+    if data == "admin_broadcast":
+        await query.edit_message_text("Send the message to broadcast to all users:")
+        context.user_data['admin_action'] = 'broadcast'
+        return
 
-    if action == 'view_user':
-        if not text.isdigit():
-            await update.message.reply_text("❌ Invalid user_id.")
-            return
-        user = get_user(int(text))
+    if data.startswith("admin_view_user"):
+        await show_user_list(query, context, "admin_view_user")
+        return
+    if data.startswith("admin_add_points"):
+        await show_user_list(query, context, "admin_add_points_select")
+        return
+    if data.startswith("admin_remove_points"):
+        await show_user_list(query, context, "admin_remove_points_select")
+        return
+    if data.startswith("admin_reset_user"):
+        await show_user_list(query, context, "admin_reset_user_confirm")
+        return
+
+    # Handle selecting user for view
+    if data.startswith("admin_view_user_"):
+        user_id = int(data.split("_")[-1])
+        user = get_user(user_id)
         if not user:
-            await update.message.reply_text("⚠️ User not found.")
+            await query.edit_message_text("⚠️ User not found.")
             return
-        msg = f"👤 User Stats:\n\nUser ID: {user[0]}\nPoints: {user[1]}\nReferrals: {user[2]}"
-        await update.message.reply_text(msg)
+        points = user[1]
+        referrals = user[2]
+        with sqlite3.connect(DB_NAME) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM tasks WHERE user_id=? AND completed=1", (user_id,))
+            completed = cursor.fetchone()[0]
+        await query.edit_message_text(f"👤 User {user_id} Stats:\nPoints: {points}\nReferrals: {referrals}\nAds Completed: {completed}",
+                                      reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="admin_main_menu")]]))
+        return
 
-    elif action == 'add_points':
-        try:
-            user_id, points = map(int, text.split())
+    # Add/Remove points selection
+    if "_select_" in data:
+        parts = data.split("_")
+        action_type = "_".join(parts[:3])
+        user_id = int(parts[3])
+        points = int(parts[4])
+        if "add" in action_type:
             update_points(user_id, points)
-            await update.message.reply_text(f"✅ Added {points} points to user {user_id}")
-        except:
-            await update.message.reply_text("❌ Format invalid. Use: user_id points_to_add")
-
-    elif action == 'remove_points':
-        try:
-            user_id, points = map(int, text.split())
+            await query.edit_message_text(f"✅ Added {points} points to user {user_id}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="admin_main_menu")]]))
+        elif "remove" in action_type:
             update_points(user_id, -points)
-            await update.message.reply_text(f"✅ Removed {points} points from user {user_id}")
-        except:
-            await update.message.reply_text("❌ Format invalid. Use: user_id points_to_remove")
+            await query.edit_message_text(f"✅ Removed {points} points from user {user_id}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="admin_main_menu")]]))
+        return
 
-    elif action == 'reset_user':
-        if not text.isdigit():
-            await update.message.reply_text("❌ Invalid user_id.")
-            return
-        user_id = int(text)
+    # Reset user confirm
+    if data.startswith("admin_reset_user_confirm_"):
+        user_id = int(data.split("_")[-1])
         with sqlite3.connect(DB_NAME) as conn:
             cursor = conn.cursor()
             cursor.execute("UPDATE users SET points=0, referrals=0 WHERE user_id=?", (user_id,))
             cursor.execute("DELETE FROM tasks WHERE user_id=?", (user_id,))
             conn.commit()
-        await update.message.reply_text(f"⚠️ User {user_id} stats have been reset!")
+        await query.edit_message_text(f"⚠️ User {user_id} stats have been reset!", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="admin_main_menu")]]))
+        return
 
-    elif action == 'broadcast':
+# Handle broadcast messages
+async def admin_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if 'admin_action' in context.user_data and context.user_data['admin_action'] == 'broadcast':
+        text = update.message.text.strip()
         with sqlite3.connect(DB_NAME) as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT user_id FROM users")
@@ -313,8 +336,7 @@ async def admin_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
             except:
                 continue
         await update.message.reply_text("✅ Broadcast sent.")
-
-    context.user_data.pop('admin_action')
+        context.user_data.pop('admin_action')
 
 # ========================
 # REPLIT SERVER KEEP-ALIVE
@@ -352,7 +374,7 @@ if __name__ == "__main__":
     application.add_handler(CallbackQueryHandler(handle_menu_button))
     application.add_handler(CallbackQueryHandler(handle_admin_buttons, pattern="^admin_"))
 
-    # Text Handler for admin inputs
+    # Text Handler for broadcast messages
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_text_handler))
 
     # Web Server Thread for Replit
