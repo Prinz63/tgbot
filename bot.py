@@ -5,147 +5,270 @@ from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandle
 import asyncio
 import random
 import string
+import uuid  # For generating unique IDs
 
-# -----------------------------
-# Logging
-# -----------------------------
+# ----------------------------
+# CONFIGURABLE SETTINGS HERE
+# ----------------------------
+BOT_TOKEN = "8041634601:AAHmkrLZmvWB1KrwT6rMZawwyG0EwMBsTls"
+
+# List of required Telegram channels user must join
+CHANNEL_ID_USERNAME_MAP = {
+    "@ptcrealchannel": "-1001183165077",
+    # "@another_channel": "-100123456789",
+}
+
+ADMIN_USER_IDS = [1234567890, 9876543210]  # Replace with real admin IDs
+WITHDRAWAL_MINIMUM = 100  # Amount in NGN
+CURRENCY_SYMBOL = "₦"
+
+# ----------------------------
+# LOGGING
+# ----------------------------
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
 )
 
-# -----------------------------
-# Database setup
-# -----------------------------
-conn = sqlite3.connect('bot.db', check_same_thread=False)
+# ----------------------------
+# DATABASE SETUP
+# ----------------------------
+conn = sqlite3.connect('ptc_bot.db', check_same_thread=False)
 cursor = conn.cursor()
 
-# Create tables
-cursor.execute('''
+cursor.executescript("""
 CREATE TABLE IF NOT EXISTS users (
     user_id INTEGER PRIMARY KEY,
     username TEXT,
-    referral_code TEXT,
     balance INTEGER DEFAULT 0,
-    referrer TEXT
-)
-''')
-conn.commit()
+    referral_code TEXT UNIQUE,
+    referred_by TEXT,
+    joined_channels BOOLEAN DEFAULT FALSE
+);
 
-# -----------------------------
-# Helpers
-# -----------------------------
+CREATE TABLE IF NOT EXISTS referrals (
+    referrer_code TEXT,
+    referred_user_id INTEGER,
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS ads (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT,
+    link TEXT
+);
+
+CREATE TABLE IF NOT EXISTS withdrawals (
+    request_id TEXT PRIMARY KEY,
+    user_id INTEGER,
+    amount REAL,
+    status TEXT CHECK(status IN ('pending', 'approved')),
+    bank_details TEXT,
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+""")
+
+# Pre-populate test ads if none exist
+cursor.execute("SELECT COUNT(*) FROM ads")
+if cursor.fetchone()[0] == 0:
+    for i in range(1, 6):
+        cursor.execute("INSERT INTO ads (title, link) VALUES (?, ?)",
+                       (f"Ad Offer #{i}", "https://otieu.com/4/9224909"))
+    conn.commit()
+conn.close()
+
+
+# ----------------------------
+# HELPER FUNCTIONS
+# ----------------------------
+
+def get_db():
+    return sqlite3.connect('ptc_bot.db')
+
+
 def generate_referral_code(length=6):
     return ''.join(random.choices(string.ascii_uppercase + string.digits, k=length))
 
-def add_user(user_id, username, referrer=None):
-    cursor.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
-    if cursor.fetchone() is None:
-        code = generate_referral_code()
-        cursor.execute(
-            "INSERT INTO users (user_id, username, referral_code, referrer) VALUES (?, ?, ?, ?)",
-            (user_id, username, code, referrer)
-        )
-        conn.commit()
+
+def register_user(user_id, username, referred_by=None):
+    db = get_db()
+    cur = db.cursor()
+    code = generate_referral_code()
+    try:
+        cur.execute("""
+            INSERT INTO users (user_id, username, referral_code, referred_by) 
+            VALUES (?, ?, ?, ?)
+        """, (user_id, username, code, referred_by))
+
+        # Add referral tracking
+        if referred_by:
+            cur.execute("INSERT INTO referrals (referrer_code, referred_user_id) VALUES (?, ?)",
+                        (referred_by, user_id))
+
+        db.commit()
         return code
-    return None
+    except sqlite3.IntegrityError:
+        return False  # Already registered
+    finally:
+        db.close()
 
-def get_balance(user_id):
-    cursor.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
-    result = cursor.fetchone()
-    return result[0] if result else 0
 
-def add_balance(user_id, amount):
-    cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (amount, user_id))
-    conn.commit()
-
-# -----------------------------
-# Commands
-# -----------------------------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def force_join_channels(update: Update) -> bool:
+    """Returns True if user passed channel checks."""
     user_id = update.effective_user.id
-    username = update.effective_user.username or "User"
-    referrer = None
+    db = get_db()
+    cur = db.cursor()
 
-    # Check if user started with a referral
-    if context.args:
-        ref_code = context.args[0]
-        cursor.execute("SELECT user_id FROM users WHERE referral_code=?", (ref_code,))
-        ref = cursor.fetchone()
-        if ref:
-            referrer = ref_code
-            # Reward referrer
-            add_balance(ref[0], 20)
+    # Fetch existing status
+    cur.execute("SELECT joined_channels FROM users WHERE user_id=?", (user_id,))
+    row = cur.fetchone()
 
-    code = add_user(user_id, username, referrer)
-    balance = get_balance(user_id)
+    if row and row[0]:  # Already checked?
+        db.close()
+        return True
 
-    keyboard = [
-        [InlineKeyboardButton("💰 Start Earning", callback_data="start_earning")],
-        [InlineKeyboardButton("📊 Balance", callback_data="balance")],
-        [InlineKeyboardButton("🏆 Referrals", callback_data="referrals")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
+    # Perform checks for all defined channels
+    failed_joins = []
 
+    for username, chat_id in CHANNEL_ID_USERNAME_MAP.items():
+        try:
+            member = await update.get_bot().get_chat_member(chat_id, user_id)
+            if member.status not in ['member', 'administrator', 'creator']:
+                failed_joins.append(username)
+        except Exception:
+            failed_joins.append(username)
+
+    if not failed_joins:
+        cur.execute("UPDATE users SET joined_channels=TRUE WHERE user_id=?", (user_id,))
+        db.commit()
+        db.close()
+        return True
+
+    keyboard = [[InlineKeyboardButton("✅ Joined Channels?", callback_data="check_subscription")]]
     await update.message.reply_text(
-        f"Welcome {username}! Your referral code is: {code}\nYour balance: ₦{balance}", 
-        reply_markup=reply_markup
+        f"You need to join the following channels to proceed:\n" +
+        '\n👉 @'.join([''] + list(map(str.strip, CHANNEL_ID_USERNAME_MAP.keys()))),
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
+    db.close()
+    return False
 
-# -----------------------------
-# Callback Query
-# -----------------------------
-ads = [
-    {"title": "Ad 1", "url": "https://otieu.com/4/9224909"},
-    {"title": "Ad 2", "url": "https://otieu.com/4/9224909"},
-    {"title": "Ad 3", "url": "https://otieu.com/4/9224909"},
-    {"title": "Ad 4", "url": "https://otieu.com/4/9224909"},
-    {"title": "Ad 5", "url": "https://otieu.com/4/9224909"},
-]
 
-async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ----------------------------
+# HANDLERS
+# ----------------------------
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    db = get_db()
+    cur = db.cursor()
+
+    referred_by = None
+    if context.args:
+        referee_code = context.args[0]
+        cur.execute("SELECT referral_code FROM users WHERE referral_code=?", (referee_code,))
+        result = cur.fetchone()
+        if result:
+            referred_by = referee_code
+
+    register_status = register_user(user.id, user.username, referred_by=referred_by)
+    db.close()
+
+    success = await force_join_channels(update)
+    if success:
+        await show_home_menu(update)
+    else:
+        pass
+
+
+async def process_callback_query(update: Update, context):
     query = update.callback_query
     await query.answer()
-    user_id = query.from_user.id
+    action = query.data.split('|')
 
-    if query.data == "balance":
-        balance = get_balance(user_id)
-        await query.edit_message_text(f"💰 Your balance: ₦{balance}")
-    
-    elif query.data == "referrals":
-        cursor.execute("SELECT COUNT(*) FROM users WHERE referrer=(SELECT referral_code FROM users WHERE user_id=?)", (user_id,))
-        count = cursor.fetchone()[0]
-        await query.edit_message_text(f"🏆 Your referrals: {count}\nEarned: ₦{count*20}")
+    if action[0] == 'menu':
+        await show_home_menu(query)
 
-    elif query.data == "start_earning":
-        keyboard = []
-        for ad in ads:
-            keyboard.append([InlineKeyboardButton(f"📌 {ad['title']}", callback_data=f"ad|{ad['url']}")])
-        await query.edit_message_text("Select an ad to view and earn:", reply_markup=InlineKeyboardMarkup(keyboard))
+    elif action[0] == 'balance':
+        await show_balance(query)
 
-    elif query.data.startswith("ad|"):
-        ad_url = query.data.split("|")[1]
-        await query.edit_message_text(f"🔗 Open this link and stay 15s: {ad_url}\n⏳ Timer starting...")
-        await start_ad_timer(context, user_id)
+    elif action[0] == 'ads':
+        await show_ads_list(query)
 
-# -----------------------------
-# Timer for ad view
-# -----------------------------
-async def start_ad_timer(context, user_id):
-    timer_msg = await context.bot.send_message(chat_id=user_id, text="⏳ Viewing ad... 15s remaining")
-    await asyncio.sleep(15)
-    await timer_msg.delete()
-    add_balance(user_id, 5)
-    await context.bot.send_message(chat_id=user_id, text="💸 ₦5 has been added to your balance!")
+    elif action[0].startswith('view_ad'):
+        ad_index = int(action[1]) - 1
+        cursor.execute("SELECT link FROM ads LIMIT 1 OFFSET ?", (ad_index,))
+        ad_link = cursor.fetchone()[0]
+        await initiate_ad_task(context, query.from_user.id, ad_link, ad_index)
 
-# -----------------------------
-# Run Bot
-# -----------------------------
-if __name__ == "__main__":
-    TOKEN = "8041634601:AAHmkrLZmvWB1KrwT6rMZawwyG0EwMBsTls"
-    app = ApplicationBuilder().token(TOKEN).build()
+    elif action[0] == 'referrals':
+        await view_referral_stats(query)
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(button))
+    elif action[0] == 'withdraw':
+        await initiate_withdraw_request(query)
 
-    print("Bot is running...")
-    app.run_polling()
+    elif action[0] == 'submit_withdraw':
+        await submit_withdraw_details(query)
+
+    elif action[0] == 'admin':
+        user_id = query.from_user.id
+        if user_id not in ADMIN_USER_IDS:
+            await query.answer("Unauthorized access.", show_alert=True)
+            return
+        await enter_admin_panel(query)
+
+    elif action[0] == 'approve_withdrawals':
+        await display_pending_withdrawals(query)
+
+    elif action[0] == 'approve_single':
+        request_id = action[1]
+        user_id = int(action[2])
+        await approve_specific_withdrawal(query, request_id, user_id)
+
+    elif action[0] == 'check_subscription':
+        success = await force_join_channels(update)
+        if success:
+            await query.edit_message_text("✅ You've joined all required channels!")
+            await show_home_menu(query)
+
+
+async def show_home_menu(update_or_query):
+    text = """
+🔹 Welcome To Premium PTC Portal 🔸
+
+Earn real cash daily watching sponsored ads. Participate safely and withdraw anytime!
+
+"""
+
+    buttons = [
+        [InlineKeyboardButton("📈 My Balance", callback_data="balance")],
+        [InlineKeyboardButton("💰 View Ads Today", callback_data="ads")],
+        [InlineKeyboardButton("🤝 Referral Dashboard", callback_data="referrals")],
+        [InlineKeyboardButton("📤 Request Withdrawal", callback_data="withdraw")],
+        [InlineKeyboardButton("🛠 Admin Access", callback_data="admin")]
+    ]
+
+    markup = InlineKeyboardMarkup(buttons)
+
+    if isinstance(update_or_query, CallbackQuery):
+        await update_or_query.edit_message_text(text=text, reply_markup=markup)
+    else:
+        await update_or_query.message.reply_text(text=text, reply_markup=markup)
+
+
+async def show_balance(update):
+    db = get_db()
+    cur = db.cursor()
+    cur.execute("SELECT balance FROM users WHERE user_id=?", (update.from_user.id,))
+    row = cur.fetchone()
+    db.close()
+
+    balance = row[0] if row else 0
+    msg = f"{CURRENCY_SYMBOL}{balance}"
+
+    buttons = [[InlineKeyboardButton("← Back", callback_data="menu")]]
+
+    await update.edit_message_text(text=f"💳 Current Balance: {msg}", reply_markup=InlineKeyboardMarkup(buttons))
+
+
+# ... truncated snippet continues below
