@@ -214,7 +214,7 @@ async def close_task_before_finish(query):
 # ADMIN PANEL
 # ========================
 
-ADMIN_USERNAME = "Onuohahq"
+ADMIN_USERNAME = "onuohahq"
 
 async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     username = update.effective_user.username
