@@ -141,7 +141,7 @@ async def start_ad_timer(context, user_id):
 # Run Bot
 # -----------------------------
 if __name__ == "__main__":
-    TOKEN = "YOUR_BOT_TOKEN_HERE"
+    TOKEN = "8041634601:AAHmkrLZmvWB1KrwT6rMZawwyG0EwMBsTls"
     app = ApplicationBuilder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
