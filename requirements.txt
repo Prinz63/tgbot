@@ -1,3 +1,2 @@
 python-telegram-bot==21.1.1
-aiosqlite
-flask
+aiosqlite==0.18.0
