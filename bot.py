@@ -214,7 +214,7 @@ async def close_task_before_finish(query):
 # FULLY CLICKABLE ADMIN PANEL
 # ========================
 
-ADMIN_USERNAME = "Onuohahq"
+ADMIN_USERNAME = "onuohahq"
 
 # Helper: get top users (default 10)
 def get_top_users(limit=10):
