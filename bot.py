@@ -1,26 +1,7 @@
-#!/usr/bin/env python3
-"""
-Modern async Telegram PTC-style bot (points system)
-Compatible with python-telegram-bot v21+
-
-Features:
-- /start with referral support
-- Dynamic ads (5 per cycle)
-- 15-second in-chat timer per ad
-- Balance stored in kobo to avoid float errors (displayed as naira)
-- 25% referral bonus paid to referrer when user completes ad
-- SQLite DB (aiosqlite) with auto-init
-- Active task protection (one active ad at a time)
-- Safe startup DB init before bot polling
-"""
-
 import os
+import sqlite3
 import asyncio
-import logging
-from datetime import datetime
-import aiosqlite
-
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -28,296 +9,232 @@ from telegram.ext import (
     ContextTypes,
 )
 
-# -------------------------
-# CONFIG
-# -------------------------
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN env var not set")
+# ========================
+# DATABASE INITIALIZATION
+# ========================
 
-# Database path - change to '/data/bot.db' if you mount persistent storage on Railway
-DB_PATH = os.environ.get("DB_PATH", "bot.db")
+DB_NAME = "bot.db"
 
-# Ads config (dynamic list; you can later move to ads table)
-ADS = [
-    {"id": "ad1", "title": "Ad 1", "url": "https://otieu.com/4/9224909"},
-    {"id": "ad2", "title": "Ad 2", "url": "https://otieu.com/4/9224909"},
-    {"id": "ad3", "title": "Ad 3", "url": "https://otieu.com/4/9224909"},
-    {"id": "ad4", "title": "Ad 4", "url": "https://otieu.com/4/9224909"},
-    {"id": "ad5", "title": "Ad 5", "url": "https://otieu.com/4/9224909"},
-]
-ADS_PER_CYCLE = 5
-AD_AMOUNT_KOBO = 500  # ₦5.00
-REFERRAL_PERCENT = 25  # 25%
-
-# Logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# -------------------------
-# Utility
-# -------------------------
-def kobo_to_naira_str(kobo: int) -> str:
-    return f"₦{kobo/100:.2f}"
-
-# -------------------------
-# DB initialization & helpers
-# -------------------------
-async def init_db():
-    """Create DB and tables if they don't exist."""
-    logger.info("Initializing DB at %s", DB_PATH)
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            username TEXT,
-            referral_code TEXT UNIQUE,
-            referrer_id INTEGER,
-            balance_kobo INTEGER DEFAULT 0,
-            created_at TEXT
-        )
+def init_db():
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                points INTEGER DEFAULT 0,
+                referrals INTEGER DEFAULT 0
+            )
         """)
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS earnings (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            ad_id TEXT,
-            amount_kobo INTEGER,
-            referrer_bonus_kobo INTEGER,
-            timestamp TEXT
-        )
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS tasks (
+                user_id INTEGER,
+                ad_id TEXT,
+                completed BOOLEAN
+            )
         """)
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS active_tasks (
-            user_id INTEGER PRIMARY KEY,
-            ad_id TEXT,
-            started_at TEXT
-        )
-        """)
-        await db.commit()
-    logger.info("DB initialized.")
+        conn.commit()
 
-async def get_user_row(user_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT user_id, username, referral_code, referrer_id, balance_kobo FROM users WHERE user_id=?", (user_id,))
-        row = await cur.fetchone()
-        return row
+def add_user(user_id):
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
+        conn.commit()
 
-async def create_user(user_id: int, username: str, ref_code: str = None):
-    async with aiosqlite.connect(DB_PATH) as db:
-        referrer_id = None
-        if ref_code:
-            cur = await db.execute("SELECT user_id FROM users WHERE referral_code=?", (ref_code,))
-            r = await cur.fetchone()
-            if r:
-                referrer_id = r[0]
-        # deterministic referral code for simplicity; can be randomized
-        referral_code = f"R{user_id}"
-        now = datetime.utcnow().isoformat()
-        await db.execute("""
-            INSERT OR IGNORE INTO users (user_id, username, referral_code, referrer_id, created_at)
-            VALUES (?, ?, ?, ?, ?)
-        """, (user_id, username, referral_code, referrer_id, now))
-        await db.commit()
-        return referral_code
+def get_user(user_id):
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
+        return cursor.fetchone()
 
-async def add_balance(user_id: int, amount_kobo: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE users SET balance_kobo = balance_kobo + ? WHERE user_id=?", (amount_kobo, user_id))
-        await db.commit()
+def update_points(user_id, delta):
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute("UPDATE users SET points = points + ? WHERE user_id=?", (delta, user_id))
+        conn.commit()
 
-async def record_earning(user_id: int, ad_id: str, amount_kobo: int, ref_bonus_kobo: int = 0):
-    async with aiosqlite.connect(DB_PATH) as db:
-        now = datetime.utcnow().isoformat()
-        await db.execute("""
-            INSERT INTO earnings (user_id, ad_id, amount_kobo, referrer_bonus_kobo, timestamp)
-            VALUES (?, ?, ?, ?, ?)
-        """, (user_id, ad_id, amount_kobo, ref_bonus_kobo, now))
-        await db.commit()
+def increment_referrals(user_id):
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute("UPDATE users SET referrals = referrals + 1 WHERE user_id=?", (user_id,))
+        conn.commit()
 
-async def set_active_task(user_id: int, ad_id: str):
-    async with aiosqlite.connect(DB_PATH) as db:
-        now = datetime.utcnow().isoformat()
-        await db.execute("INSERT OR REPLACE INTO active_tasks (user_id, ad_id, started_at) VALUES (?, ?, ?)", (user_id, ad_id, now))
-        await db.commit()
+# ========================
+# COMMAND HANDLERS
+# ========================
 
-async def clear_active_task(user_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM active_tasks WHERE user_id=?", (user_id,))
-        await db.commit()
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    referral_id = None
 
-async def get_active_task(user_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT ad_id, started_at FROM active_tasks WHERE user_id=?", (user_id,))
-        return await cur.fetchone()
+    add_user(user_id)
 
-async def get_referrer_id(user_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT referrer_id FROM users WHERE user_id=?", (user_id,))
-        r = await cur.fetchone()
-        return r[0] if r else None
+    # Check referral
+    args = context.args
+    if len(args) > 0 and args[0].isdigit():
+        referral_id = int(args[0])
+        if referral_id != user_id:
+            user_data = get_user(referral_id)
+            if user_data:
+                update_points(referral_id, 20)
+                increment_referrals(referral_id)
 
-# -------------------------
-# Handlers
-# -------------------------
-async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.effective_message
-    user = update.effective_user
-    args = context.args or []
-    ref_code = args[0] if len(args) > 0 else None
+    await send_main_menu(update)
 
-    # create user (if not exists)
-    referral_code = await create_user(user.id, user.username or user.full_name, ref_code)
-    user_row = await get_user_row(user.id)
-    bal_kobo = user_row[4] if user_row else 0
-
+async def send_main_menu(update: Update):
     keyboard = [
-        [InlineKeyboardButton("💰 Start Earning", callback_data="start_earning")],
-        [InlineKeyboardButton("📈 Balance", callback_data="balance"), InlineKeyboardButton("👥 Referrals", callback_data="referrals")],
-        [InlineKeyboardButton("❓ Help", callback_data="help")],
+        [InlineKeyboardButton("📈 Balance", callback_data="balance")],
+        [InlineKeyboardButton("👥 Referrals", callback_data="referrals")],
+        [InlineKeyboardButton("💰 Start Earning", callback_data="start_earning")]
     ]
-    share_link = f"t.me/{(context.bot.username or 'this_bot')}?start={referral_code}"
-    await msg.reply_text(
-        f"Welcome {user.first_name}!\nYour referral code: {referral_code}\nShare: {share_link}\nBalance: {kobo_to_naira_str(bal_kobo)}",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(
+        "👋 Welcome! Let's boost your points!\n\nClick below to get started:",
+        reply_markup=reply_markup
     )
 
-async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        [InlineKeyboardButton("💰 Start Earning", callback_data="start_earning")],
-        [InlineKeyboardButton("📈 Balance", callback_data="balance"), InlineKeyboardButton("👥 Referrals", callback_data="referrals")],
-        [InlineKeyboardButton("❓ Help", callback_data="help")],
-    ]
-    await update.effective_message.reply_text("Main menu:", reply_markup=InlineKeyboardMarkup(keyboard))
-
-async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+
+    if query.data == "balance":
+        await show_balance(query)
+    elif query.data == "referrals":
+        await show_referrals(query)
+    elif query.data.startswith("start_earning"):
+        await start_earning(query)
+    elif query.data.startswith("ad_"):
+        await open_ad(query)
+    elif query.data.startswith("done_"):
+        await close_task_before_finish(query)
+
+# ========================
+# BALANCE SCREEN
+# ========================
+
+async def show_balance(query):
     user_id = query.from_user.id
-    data = query.data
-
-    if data == "balance":
-        row = await get_user_row(user_id)
-        bal_kobo = row[4] if row else 0
-        await query.edit_message_text(f"📈 Your balance: {kobo_to_naira_str(bal_kobo)}")
-        return
-
-    if data == "referrals":
-        async with aiosqlite.connect(DB_PATH) as db:
-            # count direct referrals
-            cur = await db.execute("SELECT COUNT(*) FROM users WHERE referrer_id = (SELECT user_id FROM users WHERE user_id=?)", (user_id,))
-            count = (await cur.fetchone())[0]
-            # sum referral bonuses earned for tasks by referred users (optional):
-            cur2 = await db.execute("SELECT SUM(referrer_bonus_kobo) FROM earnings WHERE referrer_bonus_kobo > 0 AND user_id IN (SELECT user_id FROM users WHERE referrer_id=?)", (user_id,))
-            rr = await cur2.fetchone()
-            ref_earned = rr[0] if rr and rr[0] else 0
-        await query.edit_message_text(f"👥 Referrals: {count}\nReferral earnings: {kobo_to_naira_str(ref_earned)}")
-        return
-
-    if data == "help":
-        await query.edit_message_text("Help:\n• Click Start Earning → choose an ad → open the link and wait 15s in chat for credit.\n• Referrals give a percentage bonus to your referrer.")
-        return
-
-    if data == "start_earning":
-        buttons = []
-        for ad in ADS[:ADS_PER_CYCLE]:
-            buttons.append([InlineKeyboardButton(f"📌 {ad['title']}", callback_data=f"ad|{ad['id']}")])
-        await query.edit_message_text("Select an ad to view and earn:", reply_markup=InlineKeyboardMarkup(buttons))
-        return
-
-    if data and data.startswith("ad|"):
-        ad_id = data.split("|", 1)[1]
-        ad = next((a for a in ADS if a["id"] == ad_id), None)
-        if not ad:
-            await query.edit_message_text("Ad not found.")
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT points FROM users WHERE user_id=?", (user_id,))
+        user = cursor.fetchone()
+        if not user:
+            await query.edit_message_text(text="⚠️ User not found.")
             return
 
-        # check active task
-        active = await get_active_task(user_id)
-        if active:
-            await query.edit_message_text("You already have an active ad task. Finish it first or wait for it to expire.")
+        points = user[0]
+        cursor.execute("SELECT COUNT(*) FROM tasks WHERE user_id=? AND completed=1", (user_id,))
+        count_ads = cursor.fetchone()[0]
+
+    msg = f"""📊 Your Stats:\n\nPoints: {points}\nAds Completed: {count_ads}"""
+    await query.edit_message_text(text=msg, reply_markup=back_to_main())
+
+# ========================
+# REFERRAL INFO
+# ========================
+
+async def show_referrals(query):
+    user_id = query.from_user.id
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT referrals FROM users WHERE user_id=?", (user_id,))
+        user = cursor.fetchone()
+        if not user:
+            await query.edit_message_text(text="⚠️ User not found.")
             return
 
-        # set active task record
-        await set_active_task(user_id, ad_id)
+        total_referrals = user[0]
+        total_bonus = total_referrals * 20
 
-        # show link & start countdown message in-chat
+    msg = f"""👥 Referrals Info:\n\nTotal Referrals: {total_referrals}\nBonus Points Earned: {total_bonus}"""
+    await query.edit_message_text(text=msg, reply_markup=back_to_main())
+
+# ========================
+# START EARNING SYSTEM
+# ========================
+
+ADS = [f"https://otieu.com/4/922490{i}" for i in range(9)]
+
+async def start_earning(query):
+    btns = [[InlineKeyboardButton(f"Ad {i+1}", url=link)] +
+            [InlineKeyboardButton("✅ I'm Done", callback_data=f"done_{i}_{query.from_user.id}")]
+             for i, link in enumerate(ADS)]
+    
+    keyboard = btns[:5]  # show only first 5 ads
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await query.edit_message_text(text="Click an Ad below:", reply_markup=reply_markup)
+
+async def open_ad(query):
+    ad_index = int(query.data.split('_')[1])
+    url = ADS[ad_index]
+
+    keyboard = [[InlineKeyboardButton("✅ I'm Done", callback_data=f'done_{ad_index}_{query.from_user.id}')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    msg = await query.message.reply_text("🕒 Starting Timer...\n⏱ Counting down...")
+    
+    for sec in range(15, 0, -1):
         try:
-            await query.edit_message_text(f"🔗 Open this link and stay for 15 seconds:\n{ad['url']}\n\n⏳ Countdown starting...")
-            countdown_msg = await context.bot.send_message(chat_id=user_id, text="⏳ Viewing ad... 15s remaining")
+            await msg.edit_text(f"⏳ Timer Remaining: `{sec}s`\nDon't leave yet!", parse_mode='Markdown')
+        except:
+            break
+        await asyncio.sleep(1)
 
-            remaining = 15
-            # update fewer times to avoid hitting edit limits
-            while remaining > 0:
-                await asyncio.sleep(1)
-                remaining -= 1
-                if remaining in (10, 5, 3, 2, 1):
-                    try:
-                        await context.bot.edit_message_text(chat_id=user_id, message_id=countdown_msg.message_id, text=f"⏳ Viewing ad... {remaining}s remaining")
-                    except Exception:
-                        # user may have deleted or edits may fail; ignore safely
-                        pass
+    try:
+        await msg.delete()
+    except:
+        pass
 
-            # finished timer: credit
-            try:
-                await context.bot.delete_message(chat_id=user_id, message_id=countdown_msg.message_id)
-            except Exception:
-                pass
+    update_points(query.from_user.id, 5)
 
-            # credit user
-            await add_balance(user_id, AD_AMOUNT_KOBO)
+    await query.message.reply_text("🎉 5 points have been added to your balance!")
 
-            # referral bonus
-            ref_id = await get_referrer_id(user_id)
-            ref_bonus_kobo = 0
-            if ref_id:
-                ref_bonus_kobo = round(AD_AMOUNT_KOBO * REFERRAL_PERCENT / 100)
-                await add_balance(ref_id, ref_bonus_kobo)
+def back_to_main():
+    kb = [[InlineKeyboardButton("⬅️ Back to Menu", callback_data="main_menu")]]
+    return InlineKeyboardMarkup(kb)
 
-            # record transaction
-            await record_earning(user_id, ad_id, AD_AMOUNT_KOBO, ref_bonus_kobo)
+async def close_task_before_finish(query):
+    try:
+        await query.message.reply_text("⚠️ You closed the task before the required time. No points added.")
+        await query.edit_message_text(text=query.message.text + "\n\n(Timed Task Cancelled)")
+    except:
+        pass
 
-            # clear active task
-            await clear_active_task(user_id)
+# ========================
+# REPLIT SERVER KEEP-ALIVE
+# ========================
+from flask import Flask
+from threading import Thread
 
-            # messages
-            await context.bot.send_message(chat_id=user_id, text=f"🎉 {kobo_to_naira_str(AD_AMOUNT_KOBO)} has been added to your balance!")
-            if ref_id and ref_bonus_kobo > 0:
-                try:
-                    await context.bot.send_message(chat_id=ref_id, text=f"💸 You earned {kobo_to_naira_str(ref_bonus_kobo)} as a {REFERRAL_PERCENT}% referral bonus!")
-                except Exception:
-                    pass
+app = Flask("")
 
-        except asyncio.CancelledError:
-            await clear_active_task(user_id)
-            raise
-        except Exception as exc:
-            logger.exception("Ad timer error: %s", exc)
-            await clear_active_task(user_id)
-            try:
-                await context.bot.send_message(chat_id=user_id, text="⚠️ Something went wrong during the ad task. Please try again.")
-            except Exception:
-                pass
+@app.route("/")
+def home():
+    return "✅ Bot is running!"
 
-# -------------------------
-# Startup & main
-# -------------------------
-def main():
-    # Build application
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-
-    # Handlers
-    app.add_handler(CommandHandler("start", start_handler))
-    app.add_handler(CommandHandler("menu", menu_handler))
-    app.add_handler(CallbackQueryHandler(callback_handler))
-
-    # Run DB init BEFORE polling using asyncio.run (safe)
-    logger.info("Running DB initialization...")
-    asyncio.run(init_db())
-    logger.info("DB ready — starting polling...")
-
-    # Start polling (blocks)
-    app.run_polling()
+def run():
+    app.run(host="0.0.0.0", port=8080)
 
 if __name__ == "__main__":
-    main()
+    init_db()
+    print("[+] Initializing Telegram Bot...")
+    TOKEN = os.environ.get('BOT_TOKEN')
+
+    if not TOKEN:
+        raise ValueError("⚠️ Please set BOT_TOKEN environment variable.")
+
+    application = ApplicationBuilder().token(TOKEN).build()
+
+    # Command Handlers
+    application.add_handler(CommandHandler("start", start))
+
+    # Callback Query Handler
+    application.add_handler(CallbackQueryHandler(handle_menu_button))
+
+    # Web Server Thread for Replit
+    thread = Thread(target=run)
+    thread.start()
+
+    # Polling Mode
+    print("[+] Starting Polling...")
+    application.run_polling()
